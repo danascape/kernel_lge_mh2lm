@@ -6829,7 +6829,12 @@ int __dev_change_flags(struct net_device *dev, unsigned int flags)
 
 	dev->flags = (flags & (IFF_DEBUG | IFF_NOTRAILERS | IFF_NOARP |
 			       IFF_DYNAMIC | IFF_MULTICAST | IFF_PORTSEL |
+
+#ifdef CONFIG_LGP_DATA_TCPIP_MPTCP
+			       IFF_AUTOMEDIA | IFF_NOMULTIPATH | IFF_MPBACKUP)) |
+#else
 			       IFF_AUTOMEDIA)) |
+#endif
 		     (dev->flags & (IFF_UP | IFF_VOLATILE | IFF_PROMISC |
 				    IFF_ALLMULTI));
 
@@ -7203,7 +7208,8 @@ static int dev_new_index(struct net *net)
 	int ifindex = net->ifindex;
 
 	for (;;) {
-		if (++ifindex <= 0)
+		// LGE_CHANGE, add reset iface index condition when exceeded 1000 over(CN#04056525), 2019-06-26, ella.hwang@lge.com
+		if (++ifindex <= 0 || ifindex >= 1000)
 			ifindex = 1;
 		if (!__dev_get_by_index(net, ifindex))
 			return net->ifindex = ifindex;
@@ -7770,6 +7776,8 @@ int register_netdevice(struct net_device *dev)
 	ret = notifier_to_errno(ret);
 	if (ret) {
 		rollback_registered(dev);
+		rcu_barrier();
+
 		dev->reg_state = NETREG_UNREGISTERED;
 	}
 	/*
@@ -7920,7 +7928,7 @@ static void netdev_wait_allrefs(struct net_device *dev)
 			rebroadcast_time = jiffies;
 		}
 
-		msleep(250);
+		msleep(250*10);
 
 		refcnt = netdev_refcnt_read(dev);
 
@@ -7928,6 +7936,7 @@ static void netdev_wait_allrefs(struct net_device *dev)
 			pr_emerg("unregister_netdevice: waiting for %s to become free. Usage count = %d\n",
 				 dev->name, refcnt);
 			warning_time = jiffies;
+			break;
 		}
 	}
 }
@@ -7991,9 +8000,9 @@ void netdev_run_todo(void)
 		netdev_wait_allrefs(dev);
 
 		/* paranoia */
-		BUG_ON(netdev_refcnt_read(dev));
-		BUG_ON(!list_empty(&dev->ptype_all));
-		BUG_ON(!list_empty(&dev->ptype_specific));
+		WARN_ON(netdev_refcnt_read(dev));
+		WARN_ON(!list_empty(&dev->ptype_all));
+		WARN_ON(!list_empty(&dev->ptype_specific));
 		WARN_ON(rcu_access_pointer(dev->ip_ptr));
 		WARN_ON(rcu_access_pointer(dev->ip6_ptr));
 		WARN_ON(dev->dn_ptr);

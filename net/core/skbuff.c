@@ -76,6 +76,7 @@
 #include <linux/highmem.h>
 #include <linux/capability.h>
 #include <linux/user_namespace.h>
+#include <soc/qcom/lge/board_lge.h>
 
 struct kmem_cache *skbuff_head_cache __read_mostly;
 static struct kmem_cache *skbuff_fclone_cache __read_mostly;
@@ -536,7 +537,11 @@ static inline void skb_drop_fraglist(struct sk_buff *skb)
 	skb_drop_list(&skb_shinfo(skb)->frag_list);
 }
 
+#ifdef CONFIG_LGP_DATA_TCPIP_MPTCP
+void skb_clone_fraglist(struct sk_buff *skb)
+#else
 static void skb_clone_fraglist(struct sk_buff *skb)
+#endif
 {
 	struct sk_buff *list;
 
@@ -1309,7 +1314,11 @@ static void skb_headers_offset_update(struct sk_buff *skb, int off)
 	skb->inner_mac_header += off;
 }
 
+#ifdef CONFIG_LGP_DATA_TCPIP_MPTCP
+void copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
+#else
 static void copy_skb_header(struct sk_buff *new, const struct sk_buff *old)
+#endif
 {
 	__copy_skb_header(new, old);
 
@@ -3516,6 +3525,27 @@ struct sk_buff *skb_segment(struct sk_buff *head_skb,
 	int i = 0;
 	int pos;
 	int dummy;
+
+	if (lge_get_sku_carrier() == HW_SKU_GLOBAL) {
+		if (list_skb && !list_skb->head_frag && skb_headlen(list_skb) &&
+			(skb_shinfo(head_skb)->gso_type & SKB_GSO_DODGY)) {
+			/* gso_size is untrusted, and we have a frag_list with a linear
+			* non head_frag head.
+			*
+			* (we assume checking the first list_skb member suffices;
+			* i.e if either of the list_skb members have non head_frag
+			* head, then the first one has too).
+			*
+			* If head_skb's headlen does not fit requested gso_size, it
+			* means that the frag_list members do NOT terminate on exact
+			* gso_size boundaries. Hence we cannot perform skb_frag_t page
+			* sharing. Therefore we must fallback to copying the frag_list
+			* skbs; we do so by disabling SG.
+			*/
+			if (mss != GSO_BY_FRAGS && mss != skb_headlen(head_skb))
+				features &= ~NETIF_F_SG;
+		}
+	}
 
 	__skb_push(head_skb, doffset);
 	proto = skb_network_protocol(head_skb, &dummy);
