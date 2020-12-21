@@ -76,10 +76,13 @@ enum sde_rm_topology_control {
  *                              disable state.
  * @SDE_RM_QSYNC_CONTINUOUS_MODE: If set, Qsync is enabled in continuous
  *                              mode.
+ * @SDE_RM_QSYNC_ONE_SHOT_MODE: If set, Qsync is enabled in one shot mode.
+ *
  */
 enum sde_rm_qsync_modes {
 	SDE_RM_QSYNC_DISABLED,
 	SDE_RM_QSYNC_CONTINUOUS_MODE,
+	SDE_RM_QSYNC_ONE_SHOT_MODE
 };
 
 /**
@@ -298,6 +301,8 @@ static inline bool sde_rm_topology_is_dual_ctl(struct sde_rm *rm,
 
 	return rm->topology_tbl[topology].num_ctl == DUAL_CTL;
 }
+
+int sde_rm_get_nmixer(struct sde_rm *rm,struct drm_encoder *enc);
 
 /**
  * sde_rm_ext_blk_create_reserve - Create external HW blocks

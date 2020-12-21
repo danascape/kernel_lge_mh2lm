@@ -11,8 +11,11 @@
  * GNU General Public License for more details.
  *
  */
-
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+#define pr_fmt(fmt)	"[Display][msm-dsi-display:%s:%d] " fmt, __func__, __LINE__
+#else
 #define pr_fmt(fmt)	"msm-dsi-display:[%s] " fmt, __func__
+#endif
 
 #include <linux/list.h>
 #include <linux/of.h>
@@ -31,6 +34,26 @@
 #include "dsi_pwr.h"
 #include "sde_dbg.h"
 #include "dsi_parser.h"
+
+#ifdef CONFIG_LGE_PM_PRM
+#include "../../../soc/qcom/lge/power/main/lge_prm.h"
+#endif
+
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+#include <linux/lge_panel_notify.h>
+#include "../lge/drs/lge_drs_mngr.h"
+#include "../lge/lge_ddic_ops_helper.h"
+#include "../lge/err_detect/lge_err_detect.h"
+#include <soc/qcom/lge/board_lge.h>
+#include "../lge/brightness/lge_brightness_def.h"
+#include "../lge/cm/lge_color_manager.h"
+
+extern int lge_get_mfts_mode(void);
+
+#if IS_ENABLED(CONFIG_LGE_COVER_DISPLAY)
+#include "../lge/cover/lge_dsi_panel_cover.h"
+#endif /* CONFIG_LGE_COVER_DISPLAY */
+#endif
 
 #define to_dsi_display(x) container_of(x, struct dsi_display, host)
 #define INT_BASE_10 10
@@ -57,6 +80,22 @@ static const struct of_device_id dsi_display_dt_match[] = {
 	{.compatible = "qcom,dsi-display"},
 	{}
 };
+
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+struct dsi_display *primary_display;
+
+extern int lge_dsi_panel_drv_post_init(struct dsi_panel *panel);
+extern struct lge_blmap* lge_get_blmap(struct dsi_panel *panel, enum lge_blmap_type type);
+extern int lge_update_backlight(struct dsi_panel *panel);
+extern int lge_update_backlight_ex(struct dsi_panel *panel);
+extern int dsi_display_set_backlight_ex(struct dsi_display *dsi_display, u32 bl_lvl);
+
+#if IS_ENABLED(CONFIG_LGE_COVER_DISPLAY)
+extern int lge_update_backlight_cover(struct dsi_panel *panel);
+extern int dsi_display_set_backlight_cover(struct dsi_display *dsi_display, u32 bl_lvl);
+#endif /* CONFIG_LGE_COVER_DISPLAY */
+
+#endif
 
 static void dsi_display_mask_ctrl_error_interrupts(struct dsi_display *display,
 			u32 mask, bool enable)
@@ -188,7 +227,9 @@ int dsi_display_set_backlight(struct drm_connector *connector,
 {
 	struct dsi_display *dsi_display = display;
 	struct dsi_panel *panel;
+#if !IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
 	u32 bl_scale, bl_scale_ad;
+#endif
 	u64 bl_temp;
 	int rc = 0;
 
@@ -205,6 +246,9 @@ int dsi_display_set_backlight(struct drm_connector *connector,
 
 	panel->bl_config.bl_level = bl_lvl;
 
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+	bl_temp = bl_lvl;
+#else
 	/* scale backlight */
 	bl_scale = panel->bl_config.bl_scale;
 	bl_temp = bl_lvl * bl_scale / MAX_BL_SCALE_LEVEL;
@@ -214,6 +258,7 @@ int dsi_display_set_backlight(struct drm_connector *connector,
 
 	pr_debug("bl_scale = %u, bl_scale_ad = %u, bl_lvl = %u\n",
 		bl_scale, bl_scale_ad, (u32)bl_temp);
+#endif
 
 	rc = dsi_display_clk_ctrl(dsi_display->dsi_clk_handle,
 			DSI_CORE_CLK, DSI_CLK_ON);
@@ -769,6 +814,11 @@ static int dsi_display_status_bta_request(struct dsi_display *display)
 	return rc;
 }
 
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+#define LIMIT_OF_CONT_RECOVERY	5
+static int cont_recovery_cnt = 0;
+#endif
+
 static int dsi_display_status_check_te(struct dsi_display *display)
 {
 	int rc = 1;
@@ -779,9 +829,46 @@ static int dsi_display_status_check_te(struct dsi_display *display)
 	reinit_completion(&display->esd_te_gate);
 	if (!wait_for_completion_timeout(&display->esd_te_gate,
 				esd_te_timeout)) {
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+		if (!display->panel->lge.panel_dead) {
+			display->panel->lge.panel_dead = true;
+
+			if (display->panel->lge.bl_lvl_unset == -1 && display->panel->lge.allow_bl_update == false)
+				display->panel->lge.bl_lvl_recovery_unset = -1;
+			else if (display->panel->lge.bl_lvl_unset != -1 && display->panel->lge.allow_bl_update == false)
+				display->panel->lge.bl_lvl_recovery_unset = display->panel->lge.bl_lvl_unset;
+			else
+				display->panel->lge.bl_lvl_recovery_unset = display->panel->bl_config.bl_level;
+
+
+			if (lge_get_factory_boot() || lge_get_mfts_mode()) {
+				if (display->panel->lge.use_panel_err_detect && display->panel->lge.err_detect_irq_enabled)
+					lge_panel_err_detect_irq_control(display->panel, false);
+			}
+
+			lge_panel_notifier_call_chain(LGE_PANEL_EVENT_RECOVERY, 0, LGE_PANEL_RECOVERY_DEAD);
+
+			cont_recovery_cnt++;
+		} else {
+			pr_info("Already in recovery state\n");
+			goto out;
+		}
+
+		if (cont_recovery_cnt >= LIMIT_OF_CONT_RECOVERY)
+			panic("ESD check failed over %d times continuously\n", cont_recovery_cnt);
+
+		pr_info("cont_recovery_cnt = %d\n", cont_recovery_cnt);
+#endif
 		pr_err("TE check failed\n");
 		rc = -EINVAL;
 	}
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+	else {
+		cont_recovery_cnt = 0;
+		pr_debug("reset recovery count\n");
+	}
+out:
+#endif
 
 	dsi_display_change_te_irq_status(display, false);
 
@@ -1075,11 +1162,25 @@ int dsi_display_set_power(struct drm_connector *connector,
 {
 	struct dsi_display *display = disp;
 	int rc = 0;
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+	struct backlight_device *bd;
+	struct lge_blmap *blmap;
+struct sde_connector *c_conn;
+#endif
 
 	if (!display || !display->panel) {
 		pr_err("invalid display/panel\n");
 		return -EINVAL;
 	}
+
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+	mutex_lock(&display->display_lock);
+	pr_info("+++ power_mode=%d\n", power_mode);
+#endif
+
+#ifdef CONFIG_LGE_PM_PRM
+	lge_prm_display_set_event(LGE_PRM_DISPLAY_EVENT_MAIN_STATE, power_mode);
+#endif
 
 	switch (power_mode) {
 	case SDE_MODE_DPMS_LP1:
@@ -1088,6 +1189,11 @@ int dsi_display_set_power(struct drm_connector *connector,
 	case SDE_MODE_DPMS_LP2:
 		rc = dsi_panel_set_lp2(display->panel);
 		break;
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+	default:
+		rc = dsi_panel_set_nolp(display->panel);
+		break;
+#else /* QCT Org */
 	case SDE_MODE_DPMS_ON:
 		if (display->panel->power_mode == SDE_MODE_DPMS_LP1 ||
 			display->panel->power_mode == SDE_MODE_DPMS_LP2)
@@ -1096,9 +1202,67 @@ int dsi_display_set_power(struct drm_connector *connector,
 	case SDE_MODE_DPMS_OFF:
 	default:
 		return rc;
+#endif
 	}
 
-	pr_debug("Power mode transition from %d to %d %s",
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+	mutex_unlock(&display->display_lock);
+
+	if ((display->panel->lge.use_fp_lhbm) && (display->panel->lge.ddic_ops) &&
+			(display->panel->lge.ddic_ops->lge_set_fp_lhbm)) {
+		if (display->panel->lge.forced_lhbm == true) {
+			display->panel->lge.ddic_ops->lge_set_fp_lhbm(display->panel, LGE_FP_LHBM_FORCED_ON);
+		} else if (display->panel->lge.need_fp_lhbm_set) {
+			display->panel->lge.ddic_ops->lge_set_fp_lhbm(display->panel,
+			display->panel->lge.fp_lhbm_mode);
+			display->panel->lge.need_fp_lhbm_set = false;
+		}
+	}
+
+	if ((display->panel->lge.use_dim_ctrl) &&
+			(power_mode != SDE_MODE_DPMS_ON)) {
+		display->panel->lge.bc_dim_en = BC_DIM_OFF;
+	}
+
+	bd = display->panel->bl_config.raw_bd;
+	if (bd != NULL)
+		mutex_lock(&bd->ops_lock);
+
+    c_conn = bl_get_data(bd);
+
+	if (power_mode == SDE_MODE_DPMS_OFF) {
+		pr_info("SDE_MODE_DPMS_OFF backlight 0\n");
+		display->panel->lge.allow_bl_update = false;
+		display->panel->lge.bl_lvl_unset = -1;
+		display->panel->lge.allow_bl_update_ex = false;
+		display->panel->lge.bl_ex_lvl_unset = -1;
+		blmap = lge_get_blmap(display->panel, LGE_BLMAP_DEFAULT);
+		if (blmap && blmap->map) {
+			rc = dsi_display_set_backlight(&c_conn->base, display, blmap->map[0]);
+			if (rc) {
+				pr_err("failed to update backlight\n");
+			}
+		} else {
+			rc = dsi_display_set_backlight(&c_conn->base, display, 0);
+			if (rc) {
+				pr_err("failed to update backlight\n");
+			}
+		}
+	} else if (power_mode == SDE_MODE_DPMS_LP1 || power_mode == SDE_MODE_DPMS_LP2) {
+		display->panel->lge.allow_bl_update = false;
+		display->panel->lge.bl_lvl_unset = -1;
+	} else if (power_mode == SDE_MODE_DPMS_ON) {
+		display->panel->lge.allow_bl_update_ex = false;
+		display->panel->lge.bl_ex_lvl_unset = -1;
+	}
+
+	if (bd != NULL)
+		mutex_unlock(&bd->ops_lock);
+
+	pr_info("--- power_mode=%d\n", power_mode);
+#endif
+
+	pr_err("[Display] Power mode transition from %d to %d %s",
 		 display->panel->power_mode, power_mode,
 		 rc ? "failed" : "successful");
 	if (!rc)
@@ -2282,11 +2446,20 @@ error:
 	return rc;
 }
 
-static int dsi_display_set_clk_src(struct dsi_display *display)
+static int dsi_display_set_clk_src(struct dsi_display *display, bool on)
 {
 	int rc = 0;
 	int i;
 	struct dsi_display_ctrl *m_ctrl, *ctrl;
+	struct dsi_clk_link_set *src;
+
+	/* if XO clk is defined, select XO clk src when DSI is disabled */
+	if (on)
+		src = &display->clock_info.mux_clks;
+	else if (display->clock_info.xo_clks.byte_clk)
+		src = &display->clock_info.xo_clks;
+	else
+		return 0;
 
 	/*
 	 * In case of split DSI usecases, the clock for master controller should
@@ -2295,8 +2468,7 @@ static int dsi_display_set_clk_src(struct dsi_display *display)
 	 */
 	m_ctrl = &display->ctrl[display->clk_master_idx];
 
-	rc = dsi_ctrl_set_clock_source(m_ctrl->ctrl,
-		   &display->clock_info.mux_clks);
+	rc = dsi_ctrl_set_clock_source(m_ctrl->ctrl, src);
 	if (rc) {
 		pr_err("[%s] failed to set source clocks for master, rc=%d\n",
 			   display->name, rc);
@@ -2309,8 +2481,7 @@ static int dsi_display_set_clk_src(struct dsi_display *display)
 		if (!ctrl->ctrl || (ctrl == m_ctrl))
 			continue;
 
-		rc = dsi_ctrl_set_clock_source(ctrl->ctrl,
-			   &display->clock_info.mux_clks);
+		rc = dsi_ctrl_set_clock_source(ctrl->ctrl, src);
 		if (rc) {
 			pr_err("[%s] failed to set source clocks, rc=%d\n",
 				   display->name, rc);
@@ -3000,11 +3171,16 @@ static int dsi_display_clocks_init(struct dsi_display *display)
 	struct dsi_clk_link_set *src = &display->clock_info.src_clks;
 	struct dsi_clk_link_set *mux = &display->clock_info.mux_clks;
 	struct dsi_clk_link_set *shadow = &display->clock_info.shadow_clks;
+	struct dsi_clk_link_set *xo = &display->clock_info.xo_clks;
 	struct dsi_dyn_clk_caps *dyn_clk_caps = &(display->panel->dyn_clk_caps);
 
 	num_clk = dsi_display_get_clocks_count(display);
 
 	pr_debug("clk count=%d\n", num_clk);
+
+	dsi_clk = devm_clk_get(&display->pdev->dev, "xo_clk");
+	if (!IS_ERR_OR_NULL(dsi_clk))
+		xo->byte_clk = xo->pixel_clk = dsi_clk;
 
 	for (i = 0; i < num_clk; i++) {
 		dsi_display_get_clock_name(display, i, &clk_name);
@@ -4588,6 +4764,10 @@ int dsi_display_cont_splash_config(void *dsi_display)
 		goto splash_disabled;
 	}
 
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+	pr_info("Continuous splash is enabled\n");
+#endif
+
 	/* Update splash status for clock manager */
 	dsi_display_clk_mngr_update_splash_status(display->clk_mngr,
 				display->is_cont_splash_enabled);
@@ -4606,6 +4786,19 @@ int dsi_display_cont_splash_config(void *dsi_display)
 		goto clk_manager_update;
 	}
 
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+	if (display->panel->lge.use_labibb) {
+		/* Vote on panel regulator will be removed during suspend path */
+		rc = dsi_pwr_enable_regulator(&display->panel->power_info, true);
+		if (rc) {
+			pr_err("[%s] failed to enable vregs, rc=%d\n",
+					display->panel->name, rc);
+			goto clks_disabled;
+		}
+	} else {
+		pr_info("Skip to enable dsi regulator, use_labibb=%d\n", display->panel->lge.use_labibb);
+	}
+#else
 	/* Vote on panel regulator will be removed during suspend path */
 	rc = dsi_pwr_enable_regulator(&display->panel->power_info, true);
 	if (rc) {
@@ -4613,12 +4806,19 @@ int dsi_display_cont_splash_config(void *dsi_display)
 				display->panel->name, rc);
 		goto clks_disabled;
 	}
+#endif
 
 	dsi_config_host_engine_state_for_cont_splash(display);
 	mutex_unlock(&display->display_lock);
 
 	/* Set the current brightness level */
 	dsi_panel_bl_handoff(display->panel);
+
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+	rc = lge_dsi_panel_drv_post_init(display->panel);
+	if (rc)
+		pr_err("lge_dsi_panel_drv_post_init failed, rc=%d\n", rc);
+#endif
 
 	return rc;
 
@@ -4668,6 +4868,12 @@ int dsi_display_splash_res_cleanup(struct  dsi_display *display)
 	/* Update splash status for clock manager */
 	dsi_display_clk_mngr_update_splash_status(display->clk_mngr,
 				display->is_cont_splash_enabled);
+
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+	lge_drs_mngr_set_freeze_state(DRS_UNFREEZE);
+
+	pr_info("Continuous splash is done\n");
+#endif
 
 	return rc;
 }
@@ -4762,7 +4968,7 @@ static ssize_t sysfs_dynamic_dsi_clk_read(struct device *dev,
 static ssize_t sysfs_dynamic_dsi_clk_write(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
-	int rc = 0;
+	int rc = count;
 	int clk_rate;
 	struct dsi_display *display;
 
@@ -5303,6 +5509,10 @@ int dsi_display_dev_probe(struct platform_device *pdev)
 
 	boot_disp->node = pdev->dev.of_node;
 	boot_disp->disp = display;
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+	if (index == DSI_PRIMARY)
+		primary_display = display;
+#endif
 
 	display->disp_node = disp_node;
 	display->name = name;
@@ -6115,7 +6325,7 @@ int dsi_display_get_modes(struct dsi_display *display,
 		memset(&panel_mode, 0, sizeof(panel_mode));
 
 		rc = dsi_panel_get_mode(display->panel, mode_idx,
-						&panel_mode, topology_override);
+				&panel_mode, topology_override);
 		if (rc) {
 			pr_err("[%s] failed to get mode idx %d from panel\n",
 				   display->name, mode_idx);
@@ -6148,7 +6358,7 @@ int dsi_display_get_modes(struct dsi_display *display,
 
 		for (i = 0; i < num_dfps_rates; i++) {
 			struct dsi_display_mode *sub_mode =
-					&display->modes[array_idx];
+				&display->modes[array_idx];
 			u32 curr_refresh_rate;
 
 			if (!sub_mode) {
@@ -6514,7 +6724,7 @@ static int dsi_display_pre_switch(struct dsi_display *display)
 		goto error_ctrl_clk_off;
 	}
 
-	rc = dsi_display_set_clk_src(display);
+	rc = dsi_display_set_clk_src(display, true);
 	if (rc) {
 		pr_err("[%s] failed to set DSI link clock source, rc=%d\n",
 			display->name, rc);
@@ -6842,6 +7052,25 @@ int dsi_display_prepare(struct dsi_display *display)
 
 	mode = display->panel->cur_mode;
 
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+	if ((mode->dsi_mode_flags & DSI_MODE_FLAG_DMS) &&
+			(mode->priv_info->dsc_enabled)) {
+		if (lge_drs_mngr_is_enabled(display->panel)) {
+			rc = lge_drs_mngr_begin(display->panel);
+		}
+
+		if (display->panel->lge.use_ddic_reg_backup) {
+			/* re-init to modify timing node tx_buf */
+			if (display->panel->lge.ddic_reg_backup_complete) {
+				rc = lge_ddic_dsi_panel_reg_backup_reinit(display->panel);
+				if (rc) {
+					pr_warn("WARNING: fail to reinit backup,rc=%d\n", rc);
+				}
+			}
+		}
+	}
+#endif
+
 	dsi_display_set_ctrl_esd_check_flag(display, false);
 
 	/* Set up ctrl isr before enabling core clk */
@@ -6906,7 +7135,7 @@ int dsi_display_prepare(struct dsi_display *display)
 		}
 	}
 
-	rc = dsi_display_set_clk_src(display);
+	rc = dsi_display_set_clk_src(display, true);
 	if (rc) {
 		pr_err("[%s] failed to set DSI link clock source, rc=%d\n",
 			display->name, rc);
@@ -7134,20 +7363,10 @@ int dsi_display_pre_kickoff(struct drm_connector *connector,
 {
 	int rc = 0;
 	int i;
-	bool enable;
 
 	/* check and setup MISR */
 	if (display->misr_enable)
 		_dsi_display_setup_misr(display);
-
-	if (params->qsync_update) {
-		enable = (params->qsync_mode > 0) ? true : false;
-		rc = dsi_display_qsync(display, enable);
-		if (rc)
-			pr_err("%s failed to send qsync commands",
-				__func__);
-		SDE_EVT32(params->qsync_mode, rc);
-	}
 
 	rc = dsi_display_set_roi(display, params->rois);
 
@@ -7189,6 +7408,69 @@ wait_failure:
 	return rc;
 }
 
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+int dsi_display_post_kickoff(struct dsi_display *display)
+{
+	int rc = 0;
+	struct sde_connector *c_conn;
+
+	if (!display) {
+		SDE_ERROR("invalid display\n");
+		return -EINVAL;
+	}
+
+	c_conn = to_sde_connector(display->drm_conn);
+	if (!c_conn) {
+		SDE_ERROR("invalid connector\n");
+		return -EINVAL;
+	}
+
+	if(!display->panel) {
+		SDE_ERROR("invalid panel\n");
+		return -EINVAL;
+	}
+
+	if (c_conn->last_panel_power_mode == SDE_MODE_DPMS_ON) {
+		if ((display->panel->lge.bl_lvl_unset >= 0)
+				&& (!display->panel->lge.allow_bl_update)) {
+			rc = lge_update_backlight(display->panel);
+			if (rc) {
+				pr_err("failed to update backlight\n");
+			}
+
+			if ((display->panel->lge.use_dim_ctrl) &&
+					(display->panel->lge.bc_dim_en == BC_DIM_OFF) &&
+					(display->panel->lge.ddic_ops) &&
+					(display->panel->lge.ddic_ops->set_dim_ctrl)) {
+				display->panel->lge.ddic_ops->set_dim_ctrl(display->panel, true);
+			}
+
+		}
+
+		if (((display->panel->lge.use_irc_ctrl) ||
+				(display->panel->lge.use_ace_ctrl)) &&
+				(display->panel->lge.irc_pending) &&
+				(display->panel->lge.ddic_ops) &&
+				(display->panel->lge.ddic_ops->set_irc_state)) {
+			display->panel->lge.ddic_ops->set_irc_state(display->panel,
+						LGE_GLOBAL_IRC_HBM,
+						display->panel->lge.irc_request_state);
+		}
+	} else if (c_conn->last_panel_power_mode == SDE_MODE_DPMS_LP1 ||
+				c_conn->last_panel_power_mode == SDE_MODE_DPMS_LP2) {
+		if ((display->panel->lge.bl_ex_lvl_unset >= 0)
+				&& (!display->panel->lge.allow_bl_update_ex)) {
+			rc = lge_update_backlight_ex(display->panel);
+			if (rc) {
+				pr_err("failed to update backlight ex\n");
+			}
+		}
+	}
+
+	return rc;
+}
+#endif
+
 int dsi_display_config_ctrl_for_cont_splash(struct dsi_display *display)
 {
 	int rc = 0;
@@ -7229,6 +7511,29 @@ error_out:
 	return rc;
 }
 
+int dsi_display_pre_commit(void *display,
+		struct msm_display_conn_params *params)
+{
+	bool enable = false;
+	int rc = 0;
+
+	if (!display || !params) {
+		pr_err("Invalid params\n");
+		return -EINVAL;
+	}
+
+	if (params->qsync_update) {
+		enable = (params->qsync_mode > 0) ? true : false;
+		rc = dsi_display_qsync(display, enable);
+		if (rc)
+			pr_err("%s failed to send qsync commands\n",
+				__func__);
+		SDE_EVT32(params->qsync_mode, rc);
+	}
+
+	return rc;
+}
+
 int dsi_display_enable(struct dsi_display *display)
 {
 	int rc = 0;
@@ -7260,6 +7565,31 @@ int dsi_display_enable(struct dsi_display *display)
 		}
 
 		display->panel->panel_initialized = true;
+
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+		if (is_need_register_backup(display->panel)) {
+			rc = lge_ddic_dsi_panel_reg_backup(display->panel);
+			if (rc) {
+				pr_warn("WARNING: fail to backup, rc=%d\n", rc);
+			}
+		}
+
+		if (lge_get_factory_boot() || lge_get_mfts_mode()) {
+			if (display->panel->lge.use_panel_err_detect && !display->panel->lge.err_detect_irq_enabled) {
+				if (display->panel->lge.ddic_ops->set_err_detect_mask && display->panel->lge.is_first_err_mask) {
+					mutex_lock(&display->display_lock);
+					rc = display->panel->lge.ddic_ops->set_err_detect_mask(display->panel);
+					mutex_unlock(&display->display_lock);
+					if (rc) {
+						pr_err("enabling err detect is failed\n");
+					} else {
+						display->panel->lge.is_first_err_mask = false;
+						lge_panel_err_detect_irq_control(display->panel, true);
+					}
+				}
+			}
+		}
+#endif
 		pr_debug("cont splash enabled, display enable not required\n");
 		return 0;
 	}
@@ -7284,14 +7614,56 @@ int dsi_display_enable(struct dsi_display *display)
 		}
 	}
 
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+
+	if (!display->is_cont_splash_enabled && display->panel->panel_initialized) {
+		if (is_need_register_backup(display->panel)) {
+			rc = lge_ddic_dsi_panel_reg_backup(display->panel);
+			if (rc) {
+				pr_warn("WARNING: fail to backup, rc=%d\n", rc);
+			}
+		}
+
+		if (lge_drs_mngr_is_enabled(display->panel) &&
+				(lge_drs_mngr_get_freeze_state() < DRS_UNFREEZE)) {
+			lge_drs_mngr_set_freeze_state(DRS_UNFREEZE);
+		}
+	}
+#endif
 	if (mode->priv_info->dsc_enabled) {
 		mode->priv_info->dsc.pic_width *= display->ctrl_count;
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+		if (lge_drs_mngr_is_enabled(display->panel) &&
+				(lge_drs_mngr_get_state(display->panel) > DRS_IDLE)) {
+			if (display->panel->lge.use_internal_pps_switch) {
+				rc = dsi_panel_switch(display->panel);
+				if (rc) {
+					pr_err("panel switching fail\n");
+				}
+			}
+			rc = dsi_panel_update_pps(display->panel);
+			if (rc) {
+				pr_err("[%s] panel pps cmd update failed, rc=%d\n",
+						display->name, rc);
+				goto error;
+			}
+			rc = lge_drs_mngr_finish(display->panel);
+		} else {
+			rc = dsi_panel_update_pps(display->panel);
+			if (rc) {
+				pr_err("[%s] panel pps cmd update failed, rc=%d\n",
+						display->name, rc);
+				goto error;
+			}
+		}
+#else /* QMC Orig */
 		rc = dsi_panel_update_pps(display->panel);
 		if (rc) {
 			pr_err("[%s] panel pps cmd update failed, rc=%d\n",
 				display->name, rc);
 			goto error;
 		}
+#endif
 	}
 
 	if (mode->dsi_mode_flags & DSI_MODE_FLAG_DMS) {
@@ -7500,6 +7872,8 @@ int dsi_display_unprepare(struct dsi_display *display)
 	if (rc)
 		pr_err("[%s] panel post-unprepare failed, rc=%d\n",
 		       display->name, rc);
+
+	dsi_display_set_clk_src(display, false);
 
 	mutex_unlock(&display->display_lock);
 

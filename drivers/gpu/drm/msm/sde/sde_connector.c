@@ -24,6 +24,15 @@
 #include "sde_crtc.h"
 #include "sde_rm.h"
 
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+#include "lge/brightness/lge_brightness.h"
+#include "lge/ambient/lge_backlight_ex.h"
+#endif
+
+#if IS_ENABLED(CONFIG_LGE_COVER_DISPLAY)
+#include "lge/cover/lge_backlight_cover.h"
+#endif
+
 #define BL_NODE_NAME_SIZE 32
 
 /* Autorefresh will occur after FRAME_CNT frames. Large values are unlikely */
@@ -64,6 +73,7 @@ static const struct drm_prop_enum_list e_power_mode[] = {
 static const struct drm_prop_enum_list e_qsync_mode[] = {
 	{SDE_RM_QSYNC_DISABLED,	"none"},
 	{SDE_RM_QSYNC_CONTINUOUS_MODE,	"continuous"},
+	{SDE_RM_QSYNC_ONE_SHOT_MODE,	"one_shot"},
 };
 
 static int sde_backlight_device_update_status(struct backlight_device *bd)
@@ -74,6 +84,10 @@ static int sde_backlight_device_update_status(struct backlight_device *bd)
 	int bl_lvl;
 	struct drm_event event;
 	int rc = 0;
+
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+	return lge_backlight_device_update_status(bd);
+#endif
 
 	brightness = bd->props.brightness;
 
@@ -146,7 +160,11 @@ static int sde_backlight_setup(struct sde_connector *c_conn,
 	display = (struct dsi_display *) c_conn->display;
 	bl_config = &display->panel->bl_config;
 	props.max_brightness = bl_config->brightness_max_level;
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+	props.brightness = display->panel->lge.default_brightness;
+#else
 	props.brightness = bl_config->brightness_default_level;
+#endif
 	snprintf(bl_node_name, BL_NODE_NAME_SIZE, "panel%u-backlight",
 							display_count);
 	c_conn->bl_device = backlight_device_register(bl_node_name, dev->dev,
@@ -564,21 +582,30 @@ static int _sde_connector_update_bl_scale(struct sde_connector *c_conn)
 
 void sde_connector_set_qsync_params(struct drm_connector *connector)
 {
-	struct sde_connector *c_conn = to_sde_connector(connector);
-	u32 qsync_propval;
+	struct sde_connector *c_conn;
+	struct sde_connector_state *c_state;
+	u32 qsync_propval = 0;
+	bool prop_dirty;
 
 	if (!connector)
 		return;
 
+	c_conn = to_sde_connector(connector);
+	c_state = to_sde_connector_state(connector->state);
 	c_conn->qsync_updated = false;
-	qsync_propval = sde_connector_get_property(c_conn->base.state,
-			CONNECTOR_PROP_QSYNC_MODE);
 
-	if (qsync_propval != c_conn->qsync_mode) {
-		SDE_DEBUG("updated qsync mode %d -> %d\n", c_conn->qsync_mode,
-				qsync_propval);
-		c_conn->qsync_updated = true;
-		c_conn->qsync_mode = qsync_propval;
+	prop_dirty = msm_property_is_dirty(&c_conn->property_info,
+					&c_state->property_state,
+					CONNECTOR_PROP_QSYNC_MODE);
+	if (prop_dirty) {
+		qsync_propval = sde_connector_get_property(c_conn->base.state,
+						CONNECTOR_PROP_QSYNC_MODE);
+		if (qsync_propval != c_conn->qsync_mode) {
+			SDE_DEBUG("updated qsync mode %d -> %d\n",
+				  c_conn->qsync_mode, qsync_propval);
+			c_conn->qsync_updated = true;
+			c_conn->qsync_mode = qsync_propval;
+		}
 	}
 }
 
@@ -659,13 +686,6 @@ int sde_connector_pre_kickoff(struct drm_connector *connector)
 
 	params.rois = &c_state->rois;
 	params.hdr_meta = &c_state->hdr_meta;
-	params.qsync_update = false;
-
-	if (c_conn->qsync_updated) {
-		params.qsync_mode = c_conn->qsync_mode;
-		params.qsync_update = true;
-		SDE_EVT32(connector->base.id, params.qsync_mode);
-	}
 
 	SDE_EVT32_VERBOSE(connector->base.id);
 
@@ -674,6 +694,44 @@ int sde_connector_pre_kickoff(struct drm_connector *connector)
 end:
 	return rc;
 }
+
+int sde_connector_prepare_commit(struct drm_connector *connector)
+{
+	struct sde_connector *c_conn;
+	struct sde_connector_state *c_state;
+	struct msm_display_conn_params params;
+	int rc;
+
+	if (!connector) {
+		SDE_ERROR("invalid argument\n");
+		return -EINVAL;
+	}
+
+	c_conn = to_sde_connector(connector);
+	c_state = to_sde_connector_state(connector->state);
+	if (!c_conn->display) {
+		SDE_ERROR("invalid connector display\n");
+		return -EINVAL;
+	}
+
+	if (!c_conn->ops.prepare_commit)
+		return 0;
+
+	memset(&params, 0, sizeof(params));
+
+	if (c_conn->qsync_updated) {
+		params.qsync_mode = c_conn->qsync_mode;
+		params.qsync_update = true;
+	}
+
+	rc = c_conn->ops.prepare_commit(c_conn->display, &params);
+
+	SDE_EVT32(connector->base.id, params.qsync_mode,
+		  params.qsync_update, rc);
+
+	return rc;
+}
+
 
 void sde_connector_helper_bridge_disable(struct drm_connector *connector)
 {
@@ -783,7 +841,16 @@ void sde_connector_destroy(struct drm_connector *connector)
 		drm_property_blob_put(c_conn->blob_mode_info);
 	if (c_conn->blob_ext_hdr)
 		drm_property_blob_put(c_conn->blob_ext_hdr);
-
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+	if (c_conn->connector_type == DRM_MODE_CONNECTOR_DSI) {
+	    lge_backlight_ex_destroy(c_conn);
+	}
+#endif
+#if IS_ENABLED(CONFIG_LGE_COVER_DISPLAY)
+	if (c_conn->connector_type == DRM_MODE_CONNECTOR_DSI) {
+	    lge_backlight_cover_destroy(c_conn);
+	}
+#endif
 	if (c_conn->bl_device)
 		backlight_device_unregister(c_conn->bl_device);
 	drm_connector_unregister(connector);
@@ -1208,6 +1275,10 @@ static int sde_connector_atomic_set_property(struct drm_connector *connector,
 	case CONNECTOR_PROP_AD_BL_SCALE:
 		c_conn->bl_scale_ad = val;
 		c_conn->bl_scale_dirty = true;
+		break;
+	case CONNECTOR_PROP_QSYNC_MODE:
+		msm_property_set_dirty(&c_conn->property_info,
+				&c_state->property_state, idx);
 		break;
 	default:
 		break;
@@ -1638,6 +1709,11 @@ static int sde_connector_init_debugfs(struct drm_connector *connector)
 		debugfs_create_u32("esd_status_interval", 0600,
 				connector->debugfs_entry,
 				&sde_connector->esd_status_interval);
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+		debugfs_create_u32("force_panel_dead", 0600,
+				connector->debugfs_entry,
+				&sde_connector->force_panel_dead);
+#endif
 	}
 
 	if (!debugfs_create_bool("fb_kmap", 0600, connector->debugfs_entry,
@@ -1805,13 +1881,34 @@ static int sde_connector_atomic_check(struct drm_connector *connector,
 		struct drm_connector_state *new_conn_state)
 {
 	struct sde_connector *c_conn;
+	struct drm_crtc_state *crtc_state;
+	struct sde_connector_state *c_state;
+	bool qsync_dirty;
 
 	if (!connector) {
 		SDE_ERROR("invalid connector\n");
-		return 0;
+		return -EINVAL;
+	}
+
+	if (!new_conn_state) {
+		SDE_ERROR("invalid connector state\n");
+		return -EINVAL;
 	}
 
 	c_conn = to_sde_connector(connector);
+	c_state = to_sde_connector_state(new_conn_state);
+
+	crtc_state = drm_atomic_get_new_crtc_state(new_conn_state->state,
+						   new_conn_state->crtc);
+
+	qsync_dirty = msm_property_is_dirty(&c_conn->property_info,
+					&c_state->property_state,
+					CONNECTOR_PROP_QSYNC_MODE);
+
+	if (drm_atomic_crtc_needs_modeset(crtc_state) && qsync_dirty) {
+		SDE_ERROR("invalid qsync update during modeset\n");
+		return -EINVAL;
+	}
 
 	if (c_conn->ops.atomic_check)
 		return c_conn->ops.atomic_check(connector,
@@ -1911,6 +2008,14 @@ static void sde_connector_check_status_work(struct work_struct *work)
 	rc = conn->ops.check_status(&conn->base, conn->display, false);
 	mutex_unlock(&conn->lock);
 
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+	if (conn->force_panel_dead) {
+		conn->force_panel_dead--;
+		if (!conn->force_panel_dead)
+			goto status_dead;
+	}
+#endif
+
 	if (rc > 0) {
 		u32 interval;
 
@@ -1925,6 +2030,9 @@ static void sde_connector_check_status_work(struct work_struct *work)
 		return;
 	}
 
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+status_dead:
+#endif
 	_sde_connector_report_panel_dead(conn, false);
 }
 
@@ -2207,6 +2315,14 @@ struct drm_connector *sde_connector_init(struct drm_device *dev,
 		SDE_ERROR("failed to setup backlight, rc=%d\n", rc);
 		goto error_cleanup_fence;
 	}
+
+#if IS_ENABLED(CONFIG_LGE_DISPLAY_COMMON)
+	lge_backlight_ex_setup(c_conn, dev);
+#endif
+
+#if IS_ENABLED(CONFIG_LGE_COVER_DISPLAY)
+	lge_backlight_cover_setup(c_conn, dev);
+#endif
 
 	/* create properties */
 	msm_property_init(&c_conn->property_info, &c_conn->base.base, dev,
